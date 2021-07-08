@@ -20,6 +20,70 @@ CountDownLatch是一次性的，当count值被减为0后，不会被重置;
 CountDownLatch使用的是共享锁，count值不为0时，线程在`sync queue`中等待，自始至终只牵涉到`sync queue`，由于使用共享锁，唤醒操作不必等待锁释放后再进行，唤醒操作很迅速。
 CyclicBarrier使用的是独占锁，count值不为0时，线程进入`condition queue`中等待，当count值降为0后，将被`signalAll()`方法唤醒到`sync queue`中去，然后挨个去争锁（因为是独占锁），在前驱节点释放锁以后，才能继续唤醒后继节点。
 
+```java
+共享锁的唤醒操作:
+
+private void doAcquireShared(int arg) {
+    .......
+    int r = tryAcquireShared(arg);
+    if (r >= 0) {
+   //这里是重点，获取到锁以后的唤醒操作
+    setHeadAndPropagate(node, r);
+    .......
+ }
+    
+ 共享锁模式获取成功以后，调用了setHeadAndPropagate方法，从方法名就可以看出除了设置新的头结点以外还有一个传递动作
+ private void setHeadAndPropagate(Node node, int propagate) {
+     Node h = head; //记录当前头节点
+     //设置新的头节点，即把当前获取到锁的节点设置为头节点
+     //注：这里是获取到锁之后的操作，不需要并发控制
+     setHead(node);
+     //这里意思有两种情况是需要执行唤醒操作
+     //1.propagate > 0 表示调用方指明了后继节点需要被唤醒
+     //2.头节点后面的节点需要被唤醒（waitStatus<0），不论是老的头结点还是新的头结点
+     if (propagate > 0 || h == null || h.waitStatus < 0 ||
+         (h = head) == null || h.waitStatus < 0) {
+         Node s = node.next;
+         //如果当前节点的后继节点是共享类型或者没有后继节点，则进行唤醒
+         //这里可以理解为除非明确指明不需要唤醒（后继等待节点是独占类型），否则都要唤醒
+         if (s == null || s.isShared())
+             //后面详细说
+             doReleaseShared();
+     }
+ }
+
+ private void doReleaseShared() {
+        for (;;) {
+            //唤醒操作由头结点开始，注意这里的头节点已经是上面新设置的头结点了
+            //其实就是唤醒上面新获取到共享锁的节点的后继节点
+            Node h = head;
+            if (h != null && h != tail) {
+                int ws = h.waitStatus;
+                //表示后继节点需要被唤醒
+                if (ws == Node.SIGNAL) {
+                    //这里需要控制并发，因为入口有setHeadAndPropagate跟release两个，避免两次unpark
+                    if (!compareAndSetWaitStatus(h, Node.SIGNAL, 0))
+                        continue;      
+                    //执行唤醒操作      
+                    unparkSuccessor(h);
+                }
+                //如果后继节点暂时不需要唤醒，则把当前节点状态设置为PROPAGATE确保以后可以传递下去
+                else if (ws == 0 &&
+                         !compareAndSetWaitStatus(h, 0, Node.PROPAGATE))
+                    continue;                
+            }
+            //如果头结点没有发生变化，表示设置完成，退出循环
+            //如果头结点发生变化，比如说其他线程获取到了锁，为了使自己的唤醒动作可以传递，必须进行重试
+            if (h == head)                   
+                break;
+        }
+    }      
+    
+doAcquireShared中有个setHeadAndPropagate()方法表示等待队列中的线程成功获取到共享锁，这时候它需要唤醒它后面的共享节点（由于doReleaseShared的方法,如果有），但是当通过releaseShared（）方法(也有doReleaseShared方法)去释放一个共享锁的时候，接下来等待独占锁跟共享锁的线程都可以被唤醒进行尝试获取。
+```
+
+跟独占锁相比，共享锁的主要特征在于当一个在等待队列中的共享节点成功获取到锁以后（它获取到的是共享锁），既然是共享，那它必须要依次唤醒后面所有可以跟它一起共享当前锁资源的节点，毫无疑问，这些节点必须也是在等待共享锁（这是大前提，如果等待的是独占锁，那前面已经有一个共享节点获取锁了，它肯定是获取不到的）。当共享锁被释放的时候，可以用读写锁为例进行思考，当一个读锁被释放，此时不论是读锁还是写锁都是可以竞争资源的。
+
 ## 核心属性
 
 ```
